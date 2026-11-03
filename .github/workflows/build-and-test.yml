@@ -97,15 +97,8 @@ jobs:
           PYTHON_VERSION: ${{ matrix.python }}
         run: |
           abi="cp${PYTHON_VERSION//./}"
-          docker run --rm --init --user "$(id -u):$(id -g)" -v "$PWD:/io" -w /io \
-            -e PYTHON_ABI="$abi" -e PIP_NO_CACHE_DIR=1 -e XDG_RUNTIME_DIR=/tmp/pgserver-runtime "$MANYLINUX_IMAGE" bash -euxo pipefail -c '
-            /opt/python/"$PYTHON_ABI-$PYTHON_ABI"/bin/python -m venv /tmp/test-venv
-            export PATH=/tmp/test-venv/bin:$PATH
-            python scripts/install_wheels.py wheelhouse
-            python -m pip install pytest pytest-xdist pytest-timeout "psycopg[binary]>=3.2" psycopg2-binary "sqlalchemy>=2" sqlalchemy-utils
-            python -m pytest --ignore=tests/test_xdist.py -q
-            python -m pytest -n 2 --dist each tests/test_xdist.py -q
-          '
+          docker run --rm --init -v "$PWD:/io" -w /io -e PYTHON_ABI="$abi" "$MANYLINUX_IMAGE" \
+            bash /io/scripts/ci_test_unprivileged.sh
       - name: Test macOS installed wheels
         if: runner.os == 'macOS'
         run: |
