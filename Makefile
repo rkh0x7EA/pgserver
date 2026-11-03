@@ -1,17 +1,20 @@
 .DEFAULT_GOAL := build
+PGSERVER_VERSION ?= 16
+PYTHON ?= python
 .PHONY: build wheel install-wheel install-dev clean test
 
 build:
-	$(MAKE) -d -C pgbuild all
+	$(MAKE) -C packages/pgserver-postgres-$(PGSERVER_VERSION) build
 
 wheel: build
-	python setup.py bdist_wheel
+	$(PYTHON) -m build --wheel
+	cd packages/pgserver-postgres-$(PGSERVER_VERSION) && $(PYTHON) -m build --wheel --outdir ../../dist
 
 install-wheel: wheel
-	python -m pip install --force-reinstall dist/*.whl
+	$(PYTHON) -m pip install --force-reinstall dist/*.whl
 
 install-dev: build
-	python -m pip install --force-reinstall -e .
+	$(PYTHON) -m pip install -e packages/pgserver-postgres-$(PGSERVER_VERSION) -e .
 
 clean:
 	rm -rf build/ wheelhouse/ dist/ .eggs/

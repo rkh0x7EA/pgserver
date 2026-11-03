@@ -8,8 +8,9 @@ import logging
 import platform
 import psutil
 import time
+import shlex
 
-from ._commands import POSTGRES_BIN_PATH, initdb, pg_ctl
+from ._commands import POSTGRES_BIN_PATH, INSTALLED_POSTGRES_VERSION, initdb, pg_ctl, psql
 from .utils import find_suitable_port, find_suitable_socket_dir, DiskList, PostmasterInfo, process_is_running
 
 if platform.system() != 'Windows':
@@ -36,9 +37,13 @@ class PostgresServer:
             Constructor is intended to be called directly, use get_server() instead.
         """
         assert cleanup_mode in [None, 'stop', 'delete']
+        if POSTGRES_BIN_PATH is None:
+            major = os.environ.get('PGSERVER_VERSION', '16')
+            raise FileNotFoundError(f"Install pgserver-postgres-{major} from the matching pgserver release")
 
         self.pgdata = pgdata
         self.log = self.pgdata / 'log'
+        self.postgres_version = INSTALLED_POSTGRES_VERSION
 
         # postgres user name, NB not the same as system user name
         self.system_user = None
@@ -57,12 +62,12 @@ class PostgresServer:
         self._postmaster_info : Optional[PostmasterInfo] = None
         self._count = 0
 
-        atexit.register(self._cleanup)
         with self._lock:
-            self._instances[self.pgdata] = self
             self.ensure_pgdata_inited()
             self.ensure_postgres_running()
             self.global_process_id_list.get_and_add(os.getpid())
+            self._instances[self.pgdata] = self
+            atexit.register(self._cleanup)
 
     def get_postmaster_info(self) -> PostmasterInfo:
         assert self._postmaster_info is not None
@@ -155,7 +160,7 @@ class PostgresServer:
 
                 pg_ctl_args = ['-w',  # wait for server to start
                         '-o', '-h ""',  # no listening on any IP addresses (forwarded to postgres exec) see man postgres for -hj
-                        '-o',  f'-k {socket_dir}', # socket option (forwarded to postgres exec) see man postgres for -k
+                        '-o',  f'-k {shlex.quote(str(socket_dir))}', # socket option (forwarded to postgres exec) see man postgres for -k
                         '-l', str(self.log), # log location: set to pgdata dir also
                         'start' # action
                 ]
@@ -202,51 +207,30 @@ class PostgresServer:
 
     def _cleanup(self) -> None:
         with self._lock:
-            pids = self.global_process_id_list.get_and_remove(os.getpid())
-            _logger.info(f"exiting {os.getpid()} remaining {pids=}")
-            if pids != [os.getpid()]: # includes case where already cleaned up
+            pids = self.global_process_id_list.get()
+            if os.getpid() not in pids:
+                return
+            if pids != [os.getpid()]:
+                self.global_process_id_list.get_and_remove(os.getpid())
+                self._instances.pop(self.pgdata, None)
+                atexit.unregister(self._cleanup)
                 return
 
-            _logger.info(f"cleaning last handle for server: {self.pgdata}")
-            # last handle is being removed
-            del self._instances[self.pgdata]
-            if self.cleanup_mode is None: # done
-                return
+            if self.cleanup_mode is not None and self._postmaster_info is not None:
+                if self._postmaster_info.is_running():
+                    # Do not delete data or forget ownership if a clean shutdown fails.
+                    pg_ctl(['-w', '-t', '30', '-m', 'fast', 'stop'],
+                           pgdata=self.pgdata, user=self.system_user, timeout=35)
 
-            assert self.cleanup_mode in ['stop', 'delete']
-            if self._postmaster_info is not None:
-                if self._postmaster_info.process.is_running():
-                    try:
-                        pg_ctl(['-w', 'stop'], pgdata=self.pgdata, user=self.system_user)
-                        stopped = True
-                    except subprocess.CalledProcessError:
-                        stopped = False
-                        pass # somehow the server is already stopped.
-
-                    if not stopped:
-                        _logger.warning(f"Failed to stop server, killing it instead.")
-                        self._postmaster_info.process.terminate()
-                        try:
-                            self._postmaster_info.process.wait(2)
-                        except psutil.TimeoutExpired:
-                            pass
-                        if self._postmaster_info.process.is_running():
-                            self._postmaster_info.process.kill()
-
-            if self.cleanup_mode == 'stop':
-                return
-
-            assert self.cleanup_mode == 'delete'
-            shutil.rmtree(str(self.pgdata))
+            self.global_process_id_list.path.unlink(missing_ok=True)
+            self._instances.pop(self.pgdata, None)
             atexit.unregister(self._cleanup)
+            if self.cleanup_mode == 'delete':
+                shutil.rmtree(str(self.pgdata))
 
     def psql(self, command : str) -> str:
-        """ Runs a psql command on this server. The command is passed to psql via stdin.
-        """
-        executable = POSTGRES_BIN_PATH / 'psql'
-        stdout = subprocess.check_output(f'{executable} {self.get_uri()}',
-                                         input=command.encode(), shell=True)
-        return stdout.decode("utf-8")
+        """Runs SQL with psql, raising on SQL errors as well as connection errors."""
+        return psql(['-X', '-v', 'ON_ERROR_STOP=1', self.get_uri()], input=command)
 
     def __enter__(self):
         self._count += 1

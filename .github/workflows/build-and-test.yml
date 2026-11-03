@@ -1,117 +1,138 @@
 name: Build and Test
 on:
   push:
-    branches:
-      - testing
-      - main
-  release:
-    types:
-      - created
+    branches: [main, pg16-wheels, pg-16-17-18]
+    tags: ['v*']
+  pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+  # Build AND test against the glibc 2.28 baseline.
+  MANYLINUX_IMAGE: quay.io/pypa/manylinux_2_28_x86_64:latest
+
 jobs:
-  build_wheels:
-    name: Build wheels on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+  launcher:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install build
+      - run: python -m build --wheel
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: launcher
+          path: dist/*.whl
+          if-no-files-found: error
+
+  binaries:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: macos-12
-            arch: x86_64
-            deployment-target: '10.9'
-          - os: macos-latest
-            arch: arm64
-            deployment-target: '11.0'
-          - os: ubuntu-latest
-            arch: x86_64
-            deployment-target: ''
-          - os: windows-2022
-            arch: AMD64
-            deployment-target: ''
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v4
-        if: matrix.os != 'ubuntu-latest'
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
         with:
-          python-version: '3.10'
-      - uses: actions/setup-python@v4
-        if: matrix.os == 'ubuntu-latest'
-          # for testing due to docker env issues
-        with:
-          python-version: '3.9'
-      - name: Install cibuildwheel
+          python-version: '3.12'
+      - name: Build and audit Linux wheel
+        if: runner.os == 'Linux'
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install --upgrade cibuildwheel
-      - name: Restore postgres build from cache
-        if: ${{ matrix.os != 'ubuntu-latest' }}
-        id: restore-postgres
-        uses: actions/cache/restore@v3
+          docker run --rm -v "$PWD:/io" -w /io "$MANYLINUX_IMAGE" bash -euxo pipefail -c '
+            export PATH=/opt/python/cp312-cp312/bin:$PATH
+            python -m pip install build auditwheel patchelf
+            make -C packages/pgserver-postgres-16 build JOBS=4
+            python -m build --wheel --outdir raw-wheels packages/pgserver-postgres-16
+            auditwheel repair --plat manylinux_2_28_x86_64 --only-plat -w dist raw-wheels/*.whl
+            auditwheel show dist/*.whl
+            test "$(basename dist/*.whl)" = pgserver_postgres_16-0.2.0-py3-none-manylinux_2_28_x86_64.whl
+          '
+      - name: Build and audit macOS wheel
+        if: runner.os == 'macOS'
         env:
-          cache-name: cache-postgres
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+        run: |
+          test "$(uname -m)" = arm64
+          python -m pip install build delocate
+          make -C packages/pgserver-postgres-16 build JOBS=4
+          python -m build --wheel --outdir dist packages/pgserver-postgres-16
+          delocate-wheel --require-archs arm64 -v dist/*.whl
+          test "$(basename dist/*.whl)" = pgserver_postgres_16-0.2.0-py3-none-macosx_11_0_arm64.whl
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          path: |
-            pgbuild
-            src/pgserver/pginstall
-          key: ${{ runner.os }}-${{ runner.arch }}-build-${{ env.cache-name }}-${{
-            hashFiles('Makefile', 'pgbuild/Makefile', '.github/workflows/build-and-test.yml') }}
-      - name: Build postgres and pgvector
-        if: ${{ matrix.os != 'ubuntu-latest' && ! steps.restore-postgres.outputs.cache-hit }}
-        env:
-          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment-target }}
-        # this step is implied by Build wheels, but we do it here for caching before python tests run
-        # on ubuntu, cibuildwheel will run this step within a docker container, so it cannot use the cache this way
-        run: make
-      - name: Save postgres build
-        if: ${{ matrix.os != 'ubuntu-latest' && ! steps.restore-postgres.outputs.cache-hit }}
-        id: cache-postgres
-        uses: actions/cache/save@v3
-        env:
-          cache-name: cache-postgres
-        with:
-          path: |
-           pgbuild
-           src/pgserver/pginstall
-          key: ${{ runner.os }}-${{ runner.arch }}-build-${{ env.cache-name }}-${{
-            hashFiles('Makefile', 'pgbuild/Makefile', '.github/workflows/build-and-test.yml') }}
-      - name: Build wheels
-        env:
-          CIBW_ARCHS: ${{ matrix.arch }}
-          CIBW_SKIP: pp* cp38-* *-musllinux*
-          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment-target }}
-        run: python -m cibuildwheel --output-dir wheelhouse
-      - name: Save postgres build
-        if: ${{ matrix.os == 'ubuntu-latest' && ! steps.restore-postgres.outputs.cache-hit }}
-        id: cache-postgres2
-        uses: actions/cache/save@v3
-        env:
-          cache-name: cache-postgres
-        with:
-          path: |
-           pgbuild
-           src/pgserver/pginstall
-          key: ${{ runner.os }}-${{ runner.arch }}-build-${{ env.cache-name }}-${{
-            hashFiles('Makefile', 'pgbuild/Makefile', '.github/workflows/build-and-test.yml') }}
-      - uses: actions/upload-artifact@v3
-        with:
-          path: wheelhouse/*.whl
-          name: python-package-distributions
-  publish-to-pypi:
-    if: ${{ startsWith(github.ref, 'refs/tags/') }}
-    name: Publish Python dist to PyPI
-    needs:
-      - build_wheels
-    runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/p/pgserver  # Replace <package-name> with your PyPI project name
-    permissions:
-      id-token: write  # IMPORTANT: mandatory for trusted publishing
+          name: binary-${{ matrix.os }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  test:
+    needs: [launcher, binaries]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+        python: ['3.12', '3.13', '3.14']
+    runs-on: ${{ matrix.os }}
     steps:
-        - name: Download all the dists
-          uses: actions/download-artifact@v3
-          with:
-            name: python-package-distributions
-            path: dist/
-        - name: Publish distribution 📦 to PyPI
-          uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: launcher
+          path: wheelhouse
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: binary-${{ matrix.os }}
+          path: wheelhouse
+      - name: Test Linux installed wheels as an unprivileged user
+        if: runner.os == 'Linux'
+        env:
+          PYTHON_VERSION: ${{ matrix.python }}
+        run: |
+          abi="cp${PYTHON_VERSION//./}"
+          docker run --rm --init -v "$PWD:/io" -w /io -e PYTHON_ABI="$abi" "$MANYLINUX_IMAGE" \
+            bash /io/scripts/ci_test_unprivileged.sh
+      - name: Test macOS installed wheels
+        if: runner.os == 'macOS'
+        run: |
+          python scripts/install_wheels.py wheelhouse
+          python -m pip install pytest pytest-xdist pytest-timeout 'psycopg[binary]>=3.2' psycopg2-binary 'sqlalchemy>=2' sqlalchemy-utils
+          python -m pytest --ignore=tests/test_xdist.py -q
+          python -m pytest -n 2 --dist each tests/test_xdist.py -q
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: launcher
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: binary-*
+          path: dist
+          merge-multiple: true
+      - name: Publish wheels and checksums to GitHub Releases
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          sha256sum *.whl > SHA256SUMS
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" --generate-notes --draft
+          fi
+          gh release upload "$RELEASE_TAG" ./*.whl SHA256SUMS
+          gh release edit "$RELEASE_TAG" --draft=false

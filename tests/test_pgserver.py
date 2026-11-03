@@ -25,19 +25,14 @@ def _check_sqlalchemy_works(srv : pgserver.PostgresServer):
         create_database(uri)
 
     engine = sa.create_engine(uri)
-    conn = engine.connect()
-
-    table_name = 'table_foo'
-    with conn.begin():
-        # if table exists already, drop it
-        if engine.dialect.has_table(conn, table_name):
-            conn.execute(sa.text(f"drop table {table_name};"))
-        conn.execute(sa.text(f"create table {table_name} (id int);"))
-        conn.execute(sa.text(f"insert into {table_name} values (1);"))
-        cur = conn.execute(sa.text(f"select * from {table_name};"))
-        result = cur.fetchone()
-        assert result
-        assert result[0] == 1
+    try:
+        with engine.begin() as conn:
+            conn.execute(sa.text("DROP TABLE IF EXISTS table_foo"))
+            conn.execute(sa.text("CREATE TABLE table_foo (id int)"))
+            conn.execute(sa.text("INSERT INTO table_foo VALUES (1)"))
+            assert conn.execute(sa.text("SELECT * FROM table_foo")).fetchone()[0] == 1
+    finally:
+        engine.dispose()
 
 def _check_postmaster_info(pgdata : Path, postmaster_info : pgserver.utils.PostmasterInfo):
     assert postmaster_info is not None
