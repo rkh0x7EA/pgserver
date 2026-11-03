@@ -4,15 +4,16 @@ version = "0.2.0"  # Required
 description = "Self-contained postgres server for your python applications" # Required
 readme = "README.md" # Optional
 requires-python = ">=3.9"
-license = {file = "LICENSE.txt"}
-urls={repository="https://github.com/orm011/pgserver"}
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+urls={repository="https://github.com/rkh0x7EA/pgserver"}
 authors=[{ name="Oscar Moll", email="orm@csail.mit.edu" }]
 keywords=["postgresql", "pgvector", "pgserver", "rag"]
 dependencies = [
     "fasteners>=0.19",
     "platformdirs>=4.0.0",
     "psutil>=5.9.0",
-    "pgserver-postgres-18==0.2.0",  # Default to PostgreSQL 18
+    "pgserver-postgres-16==0.2.0",
 ]
 
 [project.optional-dependencies]
@@ -22,11 +23,17 @@ pg16 = [
 pg17 = [
     "pgserver-postgres-17==0.2.0",
 ]
+pg18 = [
+    "pgserver-postgres-18==0.2.0",
+]
 dev = [
     "sysv_ipc",
 ]
 test = [
     "pytest",
+    "pytest-xdist",
+    "pytest-timeout",
+    "psycopg[binary]>=3.2",
     "psycopg2-binary",
     "sqlalchemy>=2",
     "sqlalchemy-utils"
@@ -36,11 +43,18 @@ test = [
 where = ["src"]  # list of folders that contain the packages (["."] by default)
 include = ["pgserver*"]  # package names should match these glob patterns (["*"] by default)
 
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.package-data]
+pgserver = ["py.typed"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+timeout = 120
 
 [build-system]
 # These are the assumed default build requirements from pip:
 # https://pip.pypa.io/en/stable/reference/pip/#pep-517-and-518-support
-requires = ["setuptools>=58.0.0", "wheel"]
+requires = ["setuptools>=77.0.0"]
 build-backend = "setuptools.build_meta"

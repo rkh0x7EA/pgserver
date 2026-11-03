@@ -1,162 +1,145 @@
 name: Build and Test
 on:
   push:
-    branches:
-      - testing
-      - main
-  release:
-    types:
-      - created
+    branches: [main, pg16-wheels, pg-16-17-18]
+    tags: ['v*']
+  pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+  # Build AND test against the glibc 2.28 baseline.
+  MANYLINUX_IMAGE: quay.io/pypa/manylinux_2_28_x86_64:latest
+
 jobs:
-  # Build main pgserver package (Python code only, no binaries)
-  build_main_package:
-    name: Build main pgserver package
+  launcher:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
         with:
-          python-version: '3.14'
-
-      - name: Install build tools
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install --upgrade build
-
-      - name: Remove pginstall directory (main package shouldn't include binaries)
-        run: rm -rf src/pgserver/pginstall
-
-      - name: Build main package wheel
-        run: python -m build --wheel
-
-      - name: Upload main package wheel
-        uses: actions/upload-artifact@v4
+          python-version: '3.12'
+      - run: python -m pip install build
+      - run: python -m build --wheel
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
+          name: launcher
           path: dist/*.whl
-          name: main-package-wheels
+          if-no-files-found: error
 
-  # Build binary packages for each PostgreSQL version
-  build_binary_wheels:
-    name: Build ${{ matrix.package }} on ${{ matrix.platform }}
-    runs-on: ${{ matrix.os }}
-    needs: build_main_package  # Build main package first
+  binaries:
     strategy:
       fail-fast: false
       matrix:
-        package: [pgserver-postgres-16, pgserver-postgres-17, pgserver-postgres-18]
-        os: [ubuntu-latest, macos-15-intel, macos-latest, windows-latest]
-        include:
-          - os: ubuntu-latest
-            platform: linux-x86_64
-          - os: macos-15-intel
-            platform: macos-x86_64
-            macosx_deployment_target: '10.9'
-          - os: macos-latest
-            platform: macos-arm64
-            macosx_deployment_target: '11.0'
-          - os: windows-latest
-            platform: windows-amd64
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
         with:
-          python-version: '3.14'
-
-      - name: Install build tools
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install --upgrade build
-
-      - name: Install patchelf (Linux)
+          python-version: '3.12'
+      - name: Build and audit Linux wheel
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y patchelf
-
-      - name: Install bison and flex (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          choco install -y winflexbison3
-
-      - name: Extract PostgreSQL version from package name
-        id: pg-version
-        shell: bash
-        run: |
-          # Extract version from package name (e.g., pgserver-postgres-16 -> 16)
-          VERSION="${{ matrix.package }}"
-          VERSION="${VERSION##*-}"
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-
-      - name: Restore PostgreSQL build from cache
-        id: cache-postgres
-        uses: actions/cache@v3
-        with:
-          path: |
-            pgbuild
-            src/pgserver/pginstall
-          key: ${{ runner.os }}-${{ runner.arch }}-pg${{ steps.pg-version.outputs.version }}-${{ hashFiles('pgbuild/Makefile') }}
-
-      - name: Build binary package (Unix)
-        if: runner.os != 'Windows'
-        working-directory: packages/${{ matrix.package }}
+          docker run --rm -v "$PWD:/io" -w /io "$MANYLINUX_IMAGE" bash -euxo pipefail -c '
+            export PATH=/opt/python/cp312-cp312/bin:$PATH
+            python -m pip install build auditwheel patchelf
+            make -C packages/pgserver-postgres-16 build JOBS=4
+            python -m build --wheel --outdir raw-wheels packages/pgserver-postgres-16
+            auditwheel repair --plat manylinux_2_28_x86_64 --only-plat -w dist raw-wheels/*.whl
+            auditwheel show dist/*.whl
+            test "$(basename dist/*.whl)" = pgserver_postgres_16-0.2.0-py3-none-manylinux_2_28_x86_64.whl
+          '
+      - name: Build and audit macOS wheel
+        if: runner.os == 'macOS'
         env:
-          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macosx_deployment_target || '' }}
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
         run: |
-          make build
-          python -m build --wheel
-
-      - name: Build binary package (Windows)
-        if: runner.os == 'Windows'
-        working-directory: packages/${{ matrix.package }}
-        shell: bash
-        env:
-          BISON: "C:/ProgramData/chocolatey/bin/win_bison.exe"
-          FLEX: "C:/ProgramData/chocolatey/bin/win_flex.exe"
-        run: |
-          make build
-          python -m build --wheel
-
-      - name: Upload binary package wheels
-        uses: actions/upload-artifact@v4
+          test "$(uname -m)" = arm64
+          python -m pip install build delocate
+          make -C packages/pgserver-postgres-16 build JOBS=4
+          python -m build --wheel --outdir dist packages/pgserver-postgres-16
+          delocate-wheel --require-archs arm64 -v dist/*.whl
+          test "$(basename dist/*.whl)" = pgserver_postgres_16-0.2.0-py3-none-macosx_11_0_arm64.whl
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          path: packages/${{ matrix.package }}/dist/*.whl
-          name: binary-wheels-${{ matrix.package }}-${{ matrix.platform }}
+          name: binary-${{ matrix.os }}
+          path: dist/*.whl
+          if-no-files-found: error
 
-  # Publish to PyPI
-  publish-to-pypi:
-    if: ${{ startsWith(github.ref, 'refs/tags/') }}
-    name: Publish to PyPI
-    needs:
-      - build_binary_wheels
-      - build_main_package
-    runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/p/pgserver
-    permissions:
-      id-token: write
+  test:
+    needs: [launcher, binaries]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ['3.12', '3.13', '3.14']
+    runs-on: ${{ matrix.os }}
     steps:
-      - name: Download all binary wheels
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
         with:
-          path: dist/
-          pattern: binary-wheels-*
-          merge-multiple: true
-
-      - name: Download main package wheels
-        uses: actions/download-artifact@v4
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          path: dist/
-          name: main-package-wheels
-
-      - name: Flatten dist directory
+          name: launcher
+          path: wheelhouse
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: binary-${{ matrix.os }}
+          path: wheelhouse
+      - name: Test Linux installed wheels as an unprivileged user
+        if: runner.os == 'Linux'
+        env:
+          PYTHON_VERSION: ${{ matrix.python }}
         run: |
-          find dist -name '*.whl' -exec mv {} dist/ \;
-          find dist -type d -empty -delete
+          abi="cp${PYTHON_VERSION//./}"
+          docker run --rm --init --user "$(id -u):$(id -g)" -v "$PWD:/io" -w /io \
+            -e PYTHON_ABI="$abi" -e PIP_NO_CACHE_DIR=1 -e XDG_RUNTIME_DIR=/tmp/pgserver-runtime "$MANYLINUX_IMAGE" bash -euxo pipefail -c '
+            /opt/python/"$PYTHON_ABI-$PYTHON_ABI"/bin/python -m venv /tmp/test-venv
+            export PATH=/tmp/test-venv/bin:$PATH
+            python scripts/install_wheels.py wheelhouse
+            python -m pip install pytest pytest-xdist pytest-timeout "psycopg[binary]>=3.2" psycopg2-binary "sqlalchemy>=2" sqlalchemy-utils
+            python -m pytest --ignore=tests/test_xdist.py -q
+            python -m pytest -n 2 --dist each tests/test_xdist.py -q
+          '
+      - name: Test macOS installed wheels
+        if: runner.os == 'macOS'
+        run: |
+          python scripts/install_wheels.py wheelhouse
+          python -m pip install pytest pytest-xdist pytest-timeout 'psycopg[binary]>=3.2' psycopg2-binary 'sqlalchemy>=2' sqlalchemy-utils
+          python -m pytest --ignore=tests/test_xdist.py -q
+          python -m pytest -n 2 --dist each tests/test_xdist.py -q
 
-      - name: Publish all packages to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: launcher
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: binary-*
+          path: dist
+          merge-multiple: true
+      - name: Publish wheels and checksums to GitHub Releases
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          sha256sum *.whl > SHA256SUMS
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" --generate-notes --draft
+          fi
+          gh release upload "$RELEASE_TAG" ./*.whl SHA256SUMS
+          gh release edit "$RELEASE_TAG" --draft=false

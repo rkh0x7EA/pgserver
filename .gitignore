@@ -133,5 +133,12 @@ dmypy.json
 .idea
 
 build/
-pgbuild/
+/pgbuild/build/
+/pgbuild/downloads/
 src/pgserver/pginstall
+
+.venv-*/
+.pythons/
+.verification/
+pgvector-*.tar.gz
+packages/pgserver-postgres-*/src/pgserver_binaries/pg*/

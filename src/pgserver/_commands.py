@@ -4,42 +4,22 @@ import subprocess
 from typing import Optional, List, Callable, Tuple
 import logging
 import tempfile
-import site
+import os
+from importlib.util import find_spec
 
 def _find_postgres_binaries() -> Tuple[Optional[Path], Optional[int]]:
-    """Find PostgreSQL binaries installed by pgserver-postgres-* packages.
-
-    Returns:
-        Tuple of (bin_path, version_number) or (None, None) if not found
-    """
-    # Check all site-packages directories for pgserver_binaries
-    for site_dir in site.getsitepackages() + [site.getusersitepackages()]:
-        if not site_dir:
-            continue
-
-        binaries_base = Path(site_dir) / "pgserver_binaries"
-        if not binaries_base.exists():
-            continue
-
-        # Look for pg16, pg17, or pg18 directories
-        for pg_dir in binaries_base.glob("pg*"):
-            if not pg_dir.is_dir():
-                continue
-
-            bin_path = pg_dir / "bin"
-            if not bin_path.exists():
-                continue
-
-            # Extract version number from directory name (e.g., "pg16" -> 16)
-            try:
-                version = int(pg_dir.name[2:])
-                # Verify this is a valid PostgreSQL installation
-                if (bin_path / "postgres").exists() or (bin_path / "postgres.exe").exists():
-                    return (bin_path, version)
-            except (ValueError, IndexError):
-                continue
-
-    return (None, None)
+    """Find the requested major on Python's import path, including namespace portions."""
+    major = os.environ.get("PGSERVER_VERSION", "16")
+    if major not in ("16", "17", "18"):
+        raise ValueError("PGSERVER_VERSION must be 16, 17 or 18")
+    spec = find_spec("pgserver_binaries")
+    if spec is not None:
+        for location in spec.submodule_search_locations or ():
+            bin_path = Path(location) / f"pg{major}" / "bin"
+            executable = "postgres.exe" if sys.platform == "win32" else "postgres"
+            if (bin_path / executable).is_file():
+                return bin_path, int(major)
+    return None, None
 
 # Find installed PostgreSQL binaries
 POSTGRES_BIN_PATH, INSTALLED_POSTGRES_VERSION = _find_postgres_binaries()
@@ -60,8 +40,12 @@ def create_command_function(pg_exe_name : str) -> Callable:
             Returns:
                 The stdout of the command as a string.
         """
-        if pg_exe_name.strip('.exe') in ['initdb', 'pg_ctl', 'pg_dump']:
-           assert pgdata is not None, "pgdata must be provided for initdb, pg_ctl, and pg_dump"
+        if POSTGRES_BIN_PATH is None:
+            major = os.environ.get("PGSERVER_VERSION", "16")
+            raise FileNotFoundError(f"Install pgserver-postgres-{major} from the matching pgserver release")
+        if pg_exe_name.removesuffix('.exe') in ['initdb', 'pg_ctl']:
+            if pgdata is None:
+                raise ValueError("pgdata must be provided for initdb and pg_ctl")
 
         if pgdata is not None:
             args = ["-D", str(pgdata)] + args
@@ -95,15 +79,19 @@ def create_command_function(pg_exe_name : str) -> Callable:
 
     return command
 
-__all__ = ['INSTALLED_POSTGRES_VERSION']
+__all__ = ['INSTALLED_POSTGRES_VERSION', 'POSTGRES_BIN_PATH']
+
 
 def _init():
-    for path in POSTGRES_BIN_PATH.iterdir():
-        exe_name = path.name
-        prog = create_command_function(exe_name)
-        # Strip .exe suffix for Windows compatibility
-        function_name = exe_name.strip('.exe')
-        setattr(sys.modules[__name__], function_name, prog)
-        __all__.append(function_name)
+    names = {"initdb", "pg_ctl", "psql", "pg_dump", "pg_restore", "pg_config", "postgres"}
+    if POSTGRES_BIN_PATH is not None:
+        names.update(path.name.removesuffix('.exe') for path in POSTGRES_BIN_PATH.iterdir()
+                     if path.is_file() and (path.suffix == '.exe' if sys.platform == 'win32'
+                                            else os.access(path, os.X_OK)))
+    for name in sorted(names):
+        executable = name + ".exe" if sys.platform == "win32" else name
+        setattr(sys.modules[__name__], name, create_command_function(executable))
+        __all__.append(name)
+
 
 _init()

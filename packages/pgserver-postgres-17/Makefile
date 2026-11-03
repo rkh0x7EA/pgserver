@@ -1,11 +1,12 @@
 .DEFAULT_GOAL := build
+.PHONY: build clean
 
 build:
-	PGSERVER_VERSION=17 $(MAKE) -C ../../pgbuild all
-	rm -rf src/pgserver_binaries/pg17
+	$(MAKE) -C ../../pgbuild PGSERVER_VERSION=17 all
+	rm -rf src/pgserver_binaries/pg17 build
 	mkdir -p src/pgserver_binaries/pg17
-	cp -r ../../src/pgserver/pginstall/* src/pgserver_binaries/pg17/
+	cp -R ../../pgbuild/build/pg17/install/. src/pgserver_binaries/pg17/
 
 clean:
-	rm -rf src/pgserver_binaries/pg17
-	PGSERVER_VERSION=17 $(MAKE) -C ../../pgbuild clean
+	rm -rf src/pgserver_binaries/pg17 build
+	$(MAKE) -C ../../pgbuild PGSERVER_VERSION=17 clean
